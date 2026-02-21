@@ -155,37 +155,43 @@ CREATE POLICY "authenticated read audiograms" ON storage.objects
 
 ### 6. Review Mode Setup
 
-Run after the setup above. Implements dual vs triage dispute resolution, role-based access, and server-side auto-escalation.
+Run the **PATCH SQL** block below (single paste, idempotent). It is safe to run on a database that already has `cases`, `assignments`, and `labels` data — nothing in those tables is touched.
 
-#### 6a. Profiles Table (role management — implements Option B from §3)
+**Admin UUID:** `d7e39847-26f1-4370-ba39-a8b49a68f8dc`
 
 ```sql
-CREATE TABLE IF NOT EXISTS public.profiles (
-  user_id uuid PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
-  role    text NOT NULL DEFAULT 'expert'
-          CHECK (role IN ('admin', 'expert'))
-);
+-- ===========================================================
+-- PATCH SQL — Review Mode System
+-- Idempotent. Safe on existing data. Run in Supabase SQL Editor.
+-- Admin UUID: d7e39847-26f1-4370-ba39-a8b49a68f8dc
+-- ===========================================================
+
+
+-- ── 1. profiles: add role column if missing, seed admin ─────
+
+ALTER TABLE public.profiles
+  ADD COLUMN IF NOT EXISTS role text NOT NULL DEFAULT 'expert'
+  CHECK (role IN ('admin', 'expert'));
 
 ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
 
--- All authenticated users can read (needed for admin checks inside trigger)
+DROP POLICY IF EXISTS "authenticated read profiles" ON public.profiles;
 CREATE POLICY "authenticated read profiles"
   ON public.profiles FOR SELECT TO authenticated USING (true);
 
--- Seed your admin user (replace <your-user-uuid>)
+-- Seed admin (no angle brackets — plain UUID)
 INSERT INTO public.profiles (user_id, role)
-VALUES ('<your-user-uuid>', 'admin')
+VALUES ('d7e39847-26f1-4370-ba39-a8b49a68f8dc', 'admin')
 ON CONFLICT (user_id) DO UPDATE SET role = 'admin';
 
--- Seed expert labelers (one row per labeler)
--- INSERT INTO public.profiles (user_id, role) VALUES ('<expert-uuid>', 'expert');
-```
+-- Seed expert labelers — one row per labeler UUID:
+-- INSERT INTO public.profiles (user_id, role)
+-- VALUES ('<expert-uuid>', 'expert')
+-- ON CONFLICT (user_id) DO UPDATE SET role = 'expert';
 
-> To make a user available as a triage 3rd expert, they must have `role = 'expert'` in `profiles`. The trigger picks from this pool.
 
-#### 6b. Project Settings Table
+-- ── 2. project_settings ─────────────────────────────────────
 
-```sql
 CREATE TABLE IF NOT EXISTS public.project_settings (
   id              int  PRIMARY KEY DEFAULT 1,
   review_mode     text NOT NULL DEFAULT 'triage'
@@ -195,82 +201,88 @@ CREATE TABLE IF NOT EXISTS public.project_settings (
   CONSTRAINT single_row CHECK (id = 1)
 );
 
--- Seed the single config row
 INSERT INTO public.project_settings (id) VALUES (1)
   ON CONFLICT (id) DO NOTHING;
 
 ALTER TABLE public.project_settings ENABLE ROW LEVEL SECURITY;
 
--- All authenticated users can read
+DROP POLICY IF EXISTS "authenticated read project_settings" ON public.project_settings;
 CREATE POLICY "authenticated read project_settings"
   ON public.project_settings FOR SELECT TO authenticated USING (true);
 
--- Only admins can update
+DROP POLICY IF EXISTS "admin update project_settings" ON public.project_settings;
 CREATE POLICY "admin update project_settings"
   ON public.project_settings FOR UPDATE TO authenticated
   USING (
-    EXISTS (SELECT 1 FROM profiles WHERE user_id = auth.uid() AND role = 'admin')
+    EXISTS (SELECT 1 FROM public.profiles WHERE user_id = auth.uid() AND role = 'admin')
   )
   WITH CHECK (
-    EXISTS (SELECT 1 FROM profiles WHERE user_id = auth.uid() AND role = 'admin')
+    EXISTS (SELECT 1 FROM public.profiles WHERE user_id = auth.uid() AND role = 'admin')
   );
-```
 
-#### 6c. Case Resolution Table
 
-```sql
+-- ── 3. case_resolution ──────────────────────────────────────
+
 CREATE TABLE IF NOT EXISTS public.case_resolution (
   id             uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
-  case_id        uuid        NOT NULL UNIQUE REFERENCES cases(id),
+  case_id        uuid        NOT NULL UNIQUE REFERENCES public.cases(id),
   status         text        NOT NULL
                  CHECK (status IN ('agreed', 'disputed', 'escalated', 'resolved')),
-  final_label_id uuid        REFERENCES labels(id),
+  final_label_id uuid        REFERENCES public.labels(id),
   created_at     timestamptz NOT NULL DEFAULT now(),
   updated_at     timestamptz NOT NULL DEFAULT now()
 );
 
 ALTER TABLE public.case_resolution ENABLE ROW LEVEL SECURITY;
 
--- All authenticated users can read (for admin dashboards)
+DROP POLICY IF EXISTS "authenticated read case_resolution" ON public.case_resolution;
 CREATE POLICY "authenticated read case_resolution"
   ON public.case_resolution FOR SELECT TO authenticated USING (true);
 
-CREATE INDEX IF NOT EXISTS idx_case_resolution_status ON case_resolution(status);
-CREATE INDEX IF NOT EXISTS idx_case_resolution_case   ON case_resolution(case_id);
-```
+CREATE INDEX IF NOT EXISTS idx_case_resolution_status ON public.case_resolution(status);
+CREATE INDEX IF NOT EXISTS idx_case_resolution_case   ON public.case_resolution(case_id);
 
-#### 6d. Assignments Uniqueness Constraint
 
-```sql
--- Prevent duplicate assignments (safe to run even if assignments table already exists)
-ALTER TABLE public.assignments
-  ADD CONSTRAINT assignments_case_expert_unique UNIQUE (case_id, expert_user_id);
-```
+-- ── 4. assignments UNIQUE constraint (idempotent) ───────────
 
-#### 6e. Labels Equal Function
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'public.assignments'::regclass
+      AND contype   = 'u'
+      AND conname   = 'assignments_case_expert_unique'
+  ) THEN
+    ALTER TABLE public.assignments
+      ADD CONSTRAINT assignments_case_expert_unique UNIQUE (case_id, expert_user_id);
+  END IF;
+END;
+$$;
 
-Compares only clinically meaningful fields; ignores `notes`.
 
-```sql
+-- ── 5. labels_equal(jsonb, jsonb) ───────────────────────────
+--    Compares clinically meaningful fields; ignores notes.
+
 CREATE OR REPLACE FUNCTION public.labels_equal(a jsonb, b jsonb)
 RETURNS boolean
 LANGUAGE sql IMMUTABLE SECURITY INVOKER AS $$
   SELECT
-    a->'right_ear'       = b->'right_ear'
-    AND a->'left_ear'    = b->'left_ear'
+    a->'right_ear'           = b->'right_ear'
+    AND a->'left_ear'        = b->'left_ear'
     AND a->>'recommendation' = b->>'recommendation';
 $$;
 
 GRANT EXECUTE ON FUNCTION public.labels_equal(jsonb, jsonb) TO authenticated;
-```
 
-#### 6f. After-Label-Insert Trigger (dispute resolution engine)
 
-```sql
+-- ── 6. Trigger function (dispute engine) ────────────────────
+--    SECURITY DEFINER so it can write to assignments/case_resolution
+--    even when the calling labeler has no INSERT rights there.
+
 CREATE OR REPLACE FUNCTION public.trg_after_label_insert_fn()
 RETURNS TRIGGER
 LANGUAGE plpgsql
-SECURITY DEFINER          -- runs as function owner; bypasses RLS to write assignments/resolutions
+SECURITY DEFINER
 SET search_path = public
 AS $$
 DECLARE
@@ -280,7 +292,7 @@ DECLARE
   v_mode         text;
   v_third_expert uuid;
 BEGIN
-  -- Only act when exactly 2 labels exist for this case
+  -- Act only when exactly 2 labels exist for this case
   SELECT COUNT(*) INTO v_label_count
     FROM labels WHERE case_id = NEW.case_id;
 
@@ -288,36 +300,37 @@ BEGIN
     RETURN NEW;
   END IF;
 
-  -- Idempotency guard: skip if already resolved
+  -- Idempotency guard
   IF EXISTS (SELECT 1 FROM case_resolution WHERE case_id = NEW.case_id) THEN
     RETURN NEW;
   END IF;
 
-  -- Fetch the two labels in insertion order
+  -- Fetch both labels in insertion order
   SELECT * INTO v_label_a
     FROM labels WHERE case_id = NEW.case_id ORDER BY created_at ASC  LIMIT 1;
   SELECT * INTO v_label_b
     FROM labels WHERE case_id = NEW.case_id ORDER BY created_at DESC LIMIT 1;
 
   IF public.labels_equal(v_label_a.payload, v_label_b.payload) THEN
-    -- Labels agree → finalize
+    -- ✓ Agreed
     INSERT INTO public.case_resolution (case_id, status, final_label_id)
     VALUES (NEW.case_id, 'agreed', v_label_a.id);
 
   ELSE
-    -- Labels differ → read review mode
     SELECT review_mode INTO v_mode FROM public.project_settings WHERE id = 1;
 
     IF v_mode = 'dual' THEN
-      -- Escalate; do NOT assign a 3rd expert
+      -- ✗ Mismatch, dual mode → escalate, NO 3rd assignment
       INSERT INTO public.case_resolution (case_id, status)
       VALUES (NEW.case_id, 'escalated');
 
     ELSE  -- 'triage'
+      -- ✗ Mismatch, triage mode → disputed + auto-assign 3rd expert
       INSERT INTO public.case_resolution (case_id, status)
       VALUES (NEW.case_id, 'disputed');
 
-      -- Pick a 3rd expert not already assigned to this case
+      -- Select from profiles.user_id: role='expert', not already assigned
+      -- (admins are excluded because they have role='admin', not 'expert')
       SELECT p.user_id INTO v_third_expert
         FROM public.profiles p
         WHERE p.role = 'expert'
@@ -338,17 +351,15 @@ BEGIN
 END;
 $$;
 
--- Attach trigger
 DROP TRIGGER IF EXISTS trg_after_label_insert ON public.labels;
 CREATE TRIGGER trg_after_label_insert
   AFTER INSERT ON public.labels
   FOR EACH ROW
   EXECUTE FUNCTION public.trg_after_label_insert_fn();
-```
 
-#### 6g. Escalated Count RPC
 
-```sql
+-- ── 7. get_escalated_count RPC ──────────────────────────────
+
 CREATE OR REPLACE FUNCTION public.get_escalated_count()
 RETURNS TABLE (status text, cnt bigint)
 LANGUAGE sql STABLE SECURITY INVOKER AS $$
@@ -363,11 +374,117 @@ GRANT EXECUTE ON FUNCTION public.get_escalated_count() TO authenticated;
 
 ---
 
+### 6. VERIFY
+
+Run each block in Supabase SQL Editor to confirm the patch succeeded.
+
+```sql
+-- V1. profiles schema (expect: user_id + role columns)
+SELECT column_name, data_type, is_nullable, column_default
+FROM information_schema.columns
+WHERE table_schema = 'public' AND table_name = 'profiles'
+ORDER BY ordinal_position;
+
+-- V2. Admin row seeded correctly
+SELECT user_id, role FROM public.profiles
+WHERE user_id = 'd7e39847-26f1-4370-ba39-a8b49a68f8dc';
+-- Expected: 1 row, role = 'admin'
+
+-- V3. Table existence
+SELECT
+  to_regclass('public.project_settings') AS project_settings,
+  to_regclass('public.case_resolution')  AS case_resolution;
+-- Expected: both non-null
+
+-- V4. project_settings row
+SELECT id, review_mode, overlap_percent FROM public.project_settings;
+-- Expected: id=1, review_mode='triage', overlap_percent=0
+
+-- V5. Trigger attached to labels
+SELECT trigger_name, event_manipulation, action_timing
+FROM information_schema.triggers
+WHERE trigger_schema = 'public' AND event_object_table = 'labels';
+-- Expected: trg_after_label_insert, INSERT, AFTER
+
+-- V6. Functions exist
+SELECT proname, prosecdef AS security_definer
+FROM pg_proc
+WHERE pronamespace = 'public'::regnamespace
+  AND proname IN ('labels_equal', 'trg_after_label_insert_fn', 'get_escalated_count');
+-- Expected: 3 rows; trg_after_label_insert_fn has prosecdef=true
+
+-- V7. UNIQUE constraint on assignments
+SELECT conname FROM pg_constraint
+WHERE conrelid = 'public.assignments'::regclass AND contype = 'u';
+-- Expected: assignments_case_expert_unique
+
+-- V8. RLS policies on project_settings
+SELECT policyname, cmd FROM pg_policies
+WHERE schemaname = 'public' AND tablename = 'project_settings';
+-- Expected: "authenticated read project_settings" (SELECT) + "admin update project_settings" (UPDATE)
+
+-- V9. labels_equal smoke test (no data modified)
+SELECT public.labels_equal(
+  '{"right_ear":{"loss_type":"normal","severity":"normal","pattern":"flat"},"left_ear":{"loss_type":"normal","severity":"normal","pattern":"flat"},"recommendation":"none","notes":"ignored"}'::jsonb,
+  '{"right_ear":{"loss_type":"normal","severity":"normal","pattern":"flat"},"left_ear":{"loss_type":"normal","severity":"normal","pattern":"flat"},"recommendation":"none","notes":"different note"}'::jsonb
+) AS should_be_true;
+-- Expected: true (notes field is ignored)
+
+SELECT public.labels_equal(
+  '{"right_ear":{"loss_type":"sensorineural","severity":"mild","pattern":"sloping"},"left_ear":{"loss_type":"normal","severity":"normal","pattern":"flat"},"recommendation":"monitor"}'::jsonb,
+  '{"right_ear":{"loss_type":"normal","severity":"normal","pattern":"flat"},"left_ear":{"loss_type":"normal","severity":"normal","pattern":"flat"},"recommendation":"none"}'::jsonb
+) AS should_be_false;
+-- Expected: false
+```
+
+**Trigger path test (uses a transaction that rolls back — no real data harmed):**
+
+```sql
+-- Replace the two UUIDs with real values from your cases and auth.users tables.
+-- After ROLLBACK nothing is committed.
+DO $$
+DECLARE
+  v_case_id   uuid := '<a-real-case-uuid-from-cases>';   -- pick one from: SELECT id FROM cases LIMIT 1
+  v_expert1   uuid := 'd7e39847-26f1-4370-ba39-a8b49a68f8dc';
+  v_expert2   uuid := '<a-second-user-uuid>';              -- any other user in auth.users
+  v_mode      text;
+  v_res_status text;
+  v_assign_cnt int;
+BEGIN
+  -- Check current review_mode
+  SELECT review_mode INTO v_mode FROM public.project_settings WHERE id = 1;
+  RAISE NOTICE 'review_mode = %', v_mode;
+
+  -- Insert two mismatched labels (different right_ear loss_type)
+  INSERT INTO public.labels (case_id, expert_user_id, payload, confidence, duration_ms)
+  VALUES
+    (v_case_id, v_expert1, '{"right_ear":{"loss_type":"normal","severity":"normal","pattern":"flat"},"left_ear":{"loss_type":"normal","severity":"normal","pattern":"flat"},"recommendation":"none"}'::jsonb, 3, 1000),
+    (v_case_id, v_expert2, '{"right_ear":{"loss_type":"sensorineural","severity":"mild","pattern":"sloping"},"left_ear":{"loss_type":"normal","severity":"normal","pattern":"flat"},"recommendation":"monitor"}'::jsonb, 4, 2000);
+
+  -- Read result
+  SELECT status INTO v_res_status FROM public.case_resolution WHERE case_id = v_case_id;
+  SELECT COUNT(*) INTO v_assign_cnt FROM public.assignments WHERE case_id = v_case_id;
+
+  RAISE NOTICE 'case_resolution.status = % (expected: % mode → escalated or disputed)', v_res_status, v_mode;
+  RAISE NOTICE 'assignments count = % (triage adds 1 if 3rd expert available)', v_assign_cnt;
+
+  -- Always roll back so test data is never committed
+  RAISE EXCEPTION 'ROLLBACK_SENTINEL';
+EXCEPTION WHEN OTHERS THEN
+  IF SQLERRM <> 'ROLLBACK_SENTINEL' THEN
+    RAISE;  -- re-raise real errors
+  END IF;
+  RAISE NOTICE 'Rolled back — no data committed.';
+END;
+$$;
+```
+
+---
+
 ### Review Mode QA Checklist
 
-Run after applying §6 SQL:
-
-- **Dual mode** — insert 2 mismatched labels for a case → `case_resolution.status = 'escalated'`; `assignments` count stays at 2.
-- **Triage mode** — insert 2 mismatched labels for a case → `case_resolution.status = 'disputed'`; a 3rd `assignments` row is created for a different expert.
-- **Agreed** — insert 2 matching labels → `case_resolution.status = 'agreed'`, `final_label_id` is set.
-- **Idempotent** — inserting a 3rd label on an already-resolved case leaves `case_resolution` unchanged.
+- **Agreed** — 2 labels with identical `right_ear`, `left_ear`, `recommendation` → `case_resolution.status = 'agreed'`, `final_label_id` populated.
+- **Dual / escalated** — set `review_mode = 'dual'`, insert 2 mismatched labels → `status = 'escalated'`, `assignments` count unchanged.
+- **Triage / disputed** — set `review_mode = 'triage'`, insert 2 mismatched labels → `status = 'disputed'`, new `assignments` row for a 3rd expert (requires at least one `profiles` row with `role = 'expert'` not already assigned).
+- **Idempotent** — inserting a 3rd label on an already-resolved case leaves `case_resolution` unchanged (guard: `IF EXISTS ... RETURN NEW`).
+- **Admin toggle works** — `UPDATE public.project_settings SET review_mode = 'dual' WHERE id = 1` succeeds for admin UUID, returns error for non-admin.
