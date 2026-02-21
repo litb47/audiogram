@@ -151,11 +151,12 @@ export async function getResolutionStats(): Promise<ResolutionStat[]> {
   return (data ?? []) as ResolutionStat[]
 }
 
-// ── Upload + assignment (uses server-side RPC) ───────────────
+// ── Upload + assignment ───────────────────────────────────────
 
-export async function uploadAndCreateCasesAndAssign(
+// Default upload path: server picks exactly 2 random experts automatically.
+// Requires ≥2 profiles with role='expert' in the database.
+export async function uploadAndAutoAssign(
   files: File[],
-  expertIds: string[],           // replaces single uid — pass array of expert user_ids
   onProgress: (updates: UploadProgress[]) => void
 ): Promise<void> {
   const statuses: UploadProgress[] = files.map(f => ({
@@ -169,14 +170,52 @@ export async function uploadAndCreateCasesAndAssign(
     const path = `cases/${Date.now()}_${file.name}`
 
     try {
-      // 1. Upload file to storage (client-side, signed by anon key)
+      // 1. Upload file to storage (client-side)
       const { error: uploadError } = await supabase.storage
         .from('audiograms')
         .upload(path, file)
       if (uploadError) throw uploadError
 
-      // 2. Create case row + assignments via SECURITY DEFINER RPC
-      //    (bypasses RLS — admin check is enforced inside the function)
+      // 2. Create case + pick 2 random experts + create 2 assignments atomically
+      const { error: rpcError } = await supabase.rpc(
+        'admin_create_case_auto_assign',
+        { p_image_path: path }
+      )
+      if (rpcError) throw rpcError
+
+      statuses[i] = { filename: file.name, status: 'inserted' }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      statuses[i] = { filename: file.name, status: 'error', error: msg }
+    }
+
+    onProgress([...statuses])
+  }
+}
+
+// Manual override: caller supplies the exact expert IDs to assign.
+// Used for special cases where the admin wants to control assignment.
+export async function uploadAndCreateCasesAndAssign(
+  files: File[],
+  expertIds: string[],
+  onProgress: (updates: UploadProgress[]) => void
+): Promise<void> {
+  const statuses: UploadProgress[] = files.map(f => ({
+    filename: f.name,
+    status: 'uploading',
+  }))
+  onProgress([...statuses])
+
+  for (let i = 0; i < files.length; i++) {
+    const file = files[i]
+    const path = `cases/${Date.now()}_${file.name}`
+
+    try {
+      const { error: uploadError } = await supabase.storage
+        .from('audiograms')
+        .upload(path, file)
+      if (uploadError) throw uploadError
+
       const { error: rpcError } = await supabase.rpc(
         'admin_create_case_with_assignments',
         { p_image_path: path, p_expert_ids: expertIds }

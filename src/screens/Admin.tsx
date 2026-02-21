@@ -1,6 +1,6 @@
 import { useRef, useState, useEffect } from 'react'
 import {
-  uploadAndCreateCasesAndAssign,
+  uploadAndAutoAssign,
   UploadProgress,
   ReviewMode,
   ExpertProfile,
@@ -29,7 +29,6 @@ export default function Admin({ navigate, reviewMode, onReviewModeChange }: Prop
 
   const [isAdmin, setIsAdmin] = useState(false)
   const [experts, setExperts] = useState<ExpertProfile[]>([])
-  const [selectedExperts, setSelectedExperts] = useState<Set<string>>(new Set())
   const [expertStats, setExpertStats] = useState<ExpertStat[]>([])
   const [resolutionStats, setResolutionStats] = useState<ResolutionStat[]>([])
   const [statsLoading, setStatsLoading] = useState(true)
@@ -44,7 +43,6 @@ export default function Admin({ navigate, reviewMode, onReviewModeChange }: Prop
       ])
       setIsAdmin(role === 'admin')
       setExperts(profiles)
-      setSelectedExperts(new Set(profiles.map(p => p.user_id)))
 
       // Load stats (may fail if case_resolution doesn't exist yet)
       const [stats, res] = await Promise.allSettled([getExpertStats(), getResolutionStats()])
@@ -68,32 +66,17 @@ export default function Admin({ navigate, reviewMode, onReviewModeChange }: Prop
     }
   }
 
-  function toggleExpert(uid: string) {
-    setSelectedExperts(prev => {
-      const next = new Set(prev)
-      if (next.has(uid)) next.delete(uid)
-      else next.add(uid)
-      return next
-    })
-  }
-
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
     const files = Array.from(fileRef.current?.files ?? [])
     if (files.length === 0) return
-
-    const assignTo = [...selectedExperts]
-    if (assignTo.length === 0) {
-      setUploadError('Select at least one expert to assign cases to.')
-      return
-    }
 
     setUploadError('')
     setDone(false)
     setUploading(true)
 
     try {
-      await uploadAndCreateCasesAndAssign(files, assignTo, setProgress)
+      await uploadAndAutoAssign(files, setProgress)
     } catch (err) {
       setUploadError(err instanceof Error ? err.message : String(err))
     } finally {
@@ -217,29 +200,14 @@ export default function Admin({ navigate, reviewMode, onReviewModeChange }: Prop
       <div className="card">
         <h2 style={{ marginBottom: '0.75rem' }}>Upload cases</h2>
 
-        {/* Expert assignment selection */}
-        {experts.length > 0 ? (
-          <div className="field">
-            <label>Assign to experts</label>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem', marginTop: '0.25rem' }}>
-              {experts.map(p => (
-                <label key={p.user_id} style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer', fontSize: '0.875rem' }}>
-                  <input
-                    type="checkbox"
-                    checked={selectedExperts.has(p.user_id)}
-                    onChange={() => toggleExpert(p.user_id)}
-                  />
-                  <span style={{ fontFamily: 'monospace', color: '#374151' }}>
-                    {p.user_id.slice(0, 8)}…
-                  </span>
-                </label>
-              ))}
-            </div>
-          </div>
+        {/* Expert pool info */}
+        {experts.length >= 2 ? (
+          <p style={{ fontSize: '0.875rem', color: '#6b7280', marginBottom: '0.75rem' }}>
+            Each case will be auto-assigned to 2 random experts from the pool of {experts.length}.
+          </p>
         ) : (
-          <p style={{ fontSize: '0.875rem', color: '#9ca3af', marginBottom: '0.75rem' }}>
-            No experts in profiles yet. Add expert rows to{' '}
-            <code>public.profiles</code> before uploading.
+          <p style={{ fontSize: '0.875rem', color: '#dc2626', marginBottom: '0.75rem' }}>
+            Need at least 2 experts in <code>public.profiles</code> before uploading (currently {experts.length}).
           </p>
         )}
 
@@ -261,9 +229,9 @@ export default function Admin({ navigate, reviewMode, onReviewModeChange }: Prop
             <button
               type="submit"
               className="btn-primary"
-              disabled={uploading || selectedExperts.size === 0}
+              disabled={uploading || experts.length < 2}
             >
-              {uploading ? 'Uploading…' : `Upload & assign to ${selectedExperts.size} expert${selectedExperts.size !== 1 ? 's' : ''}`}
+              {uploading ? 'Uploading…' : 'Upload & auto-assign'}
             </button>
           </div>
         </form>

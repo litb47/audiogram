@@ -526,6 +526,67 @@ GRANT EXECUTE ON FUNCTION public.admin_create_case_with_assignments(text, uuid[]
 
 
 -- ══════════════════════════════════════════════════════════════
+-- J2. admin_create_case_auto_assign RPC  ← DEFAULT UPLOAD PATH
+--     Automatically selects exactly 2 distinct random experts
+--     from profiles WHERE role='expert'. No expert IDs needed
+--     from the frontend. Fails if fewer than 2 experts exist.
+-- ══════════════════════════════════════════════════════════════
+
+CREATE OR REPLACE FUNCTION public.admin_create_case_auto_assign(p_image_path text)
+RETURNS uuid
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_case_id uuid;
+  v_experts uuid[];
+BEGIN
+  -- Guard: caller must be admin
+  IF NOT EXISTS (
+    SELECT 1 FROM public.profiles
+    WHERE user_id = auth.uid() AND role = 'admin'
+  ) THEN
+    RAISE EXCEPTION 'Permission denied: admin role required';
+  END IF;
+
+  -- Pick exactly 2 distinct random experts (ORDER BY random() on a UNIQUE
+  -- user_id column guarantees no duplicates; LIMIT 2 caps the count)
+  SELECT ARRAY_AGG(user_id) INTO v_experts
+  FROM (
+    SELECT user_id
+    FROM public.profiles
+    WHERE role = 'expert'
+    ORDER BY random()
+    LIMIT 2
+  ) sub;
+
+  -- Require at least 2 experts to be registered
+  IF v_experts IS NULL OR array_length(v_experts, 1) < 2 THEN
+    RAISE EXCEPTION
+      'Need at least 2 profiles with role=''expert'' to auto-assign. '
+      'Add expert rows to public.profiles before uploading.';
+  END IF;
+
+  -- Create the case
+  INSERT INTO public.cases (image_path)
+  VALUES (p_image_path)
+  RETURNING id INTO v_case_id;
+
+  -- Create exactly 2 assignments atomically
+  -- ON CONFLICT guard respects UNIQUE(case_id, expert_user_id)
+  INSERT INTO public.assignments (case_id, expert_user_id)
+  SELECT v_case_id, unnest(v_experts)
+  ON CONFLICT (case_id, expert_user_id) DO NOTHING;
+
+  RETURN v_case_id;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.admin_create_case_auto_assign(text) TO authenticated;
+
+
+-- ══════════════════════════════════════════════════════════════
 -- K. Dashboard RPCs
 -- ══════════════════════════════════════════════════════════════
 
@@ -752,14 +813,38 @@ EXCEPTION WHEN OTHERS THEN
   RAISE NOTICE 'Rolled back.';
 END; $$;
 
--- ── TEST D: Admin visibility ──────────────────────────────────
+-- ── TEST D: auto-assign creates exactly 2 assignments ────────
+-- Run as admin. Requires ≥2 expert rows in profiles.
+DO $$
+DECLARE
+  v_case_id  uuid;
+  v_a_count  int;
+  v_distinct int;
+BEGIN
+  -- Call the auto-assign function (creates case + 2 assignments)
+  SELECT public.admin_create_case_auto_assign('test/auto_assign_test.jpg')
+  INTO v_case_id;
+
+  SELECT COUNT(*)                        INTO v_a_count  FROM public.assignments WHERE case_id = v_case_id;
+  SELECT COUNT(DISTINCT expert_user_id)  INTO v_distinct FROM public.assignments WHERE case_id = v_case_id;
+
+  RAISE NOTICE 'AUTO-ASSIGN TEST: assignments=% distinct_experts=%', v_a_count, v_distinct;
+  -- Expect: assignments=2, distinct_experts=2
+
+  -- Clean up test data
+  DELETE FROM public.assignments WHERE case_id = v_case_id;
+  DELETE FROM public.cases       WHERE id      = v_case_id;
+  RAISE NOTICE 'Test data cleaned up.';
+END; $$;
+
+-- ── TEST E: Admin visibility ──────────────────────────────────
 -- Run as your admin user in the Supabase dashboard (Table Editor)
 -- or via the JS client logged in as admin:
 --   SELECT COUNT(*) FROM cases;       -- expect: all rows
 --   SELECT COUNT(*) FROM assignments; -- expect: all rows
 --   SELECT COUNT(*) FROM labels;      -- expect: all rows
 
--- ── TEST E: Expert visibility (simulate via SQL) ──────────────
+-- ── TEST F: Expert visibility (simulate via SQL) ───────────────
 -- Impersonate an expert by setting auth context (Supabase SQL Editor → run as service role won't work;
 -- use the frontend app logged in as an expert to verify queue only shows assigned cases)
 ```
