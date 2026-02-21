@@ -1,12 +1,15 @@
 import { useRef, useState, useEffect } from 'react'
 import {
-  getCurrentUserId,
   uploadAndCreateCasesAndAssign,
   UploadProgress,
   ReviewMode,
+  ExpertProfile,
+  ExpertStat,
+  ResolutionStat,
   setReviewMode as apiSetReviewMode,
-  getEscalatedCounts,
-  EscalatedCounts,
+  getExpertProfiles,
+  getExpertStats,
+  getResolutionStats,
   getUserRole,
 } from '../api'
 import type { Screen } from '../App'
@@ -21,17 +24,35 @@ export default function Admin({ navigate, reviewMode, onReviewModeChange }: Prop
   const fileRef = useRef<HTMLInputElement>(null)
   const [progress, setProgress] = useState<UploadProgress[]>([])
   const [uploading, setUploading] = useState(false)
-  const [error, setError] = useState('')
+  const [uploadError, setUploadError] = useState('')
   const [done, setDone] = useState(false)
 
   const [isAdmin, setIsAdmin] = useState(false)
-  const [counts, setCounts] = useState<EscalatedCounts | null>(null)
+  const [experts, setExperts] = useState<ExpertProfile[]>([])
+  const [selectedExperts, setSelectedExperts] = useState<Set<string>>(new Set())
+  const [expertStats, setExpertStats] = useState<ExpertStat[]>([])
+  const [resolutionStats, setResolutionStats] = useState<ResolutionStat[]>([])
+  const [statsLoading, setStatsLoading] = useState(true)
   const [settingMode, setSettingMode] = useState(false)
   const [modeError, setModeError] = useState('')
 
   useEffect(() => {
-    getUserRole().then(role => setIsAdmin(role === 'admin'))
-    getEscalatedCounts().then(setCounts).catch(() => {})
+    async function load() {
+      const [role, profiles] = await Promise.all([
+        getUserRole(),
+        getExpertProfiles().catch(() => [] as ExpertProfile[]),
+      ])
+      setIsAdmin(role === 'admin')
+      setExperts(profiles)
+      setSelectedExperts(new Set(profiles.map(p => p.user_id)))
+
+      // Load stats (may fail if case_resolution doesn't exist yet)
+      const [stats, res] = await Promise.allSettled([getExpertStats(), getResolutionStats()])
+      if (stats.status === 'fulfilled') setExpertStats(stats.value)
+      if (res.status === 'fulfilled') setResolutionStats(res.value)
+      setStatsLoading(false)
+    }
+    load()
   }, [])
 
   async function handleModeChange(mode: ReviewMode) {
@@ -47,20 +68,34 @@ export default function Admin({ navigate, reviewMode, onReviewModeChange }: Prop
     }
   }
 
+  function toggleExpert(uid: string) {
+    setSelectedExperts(prev => {
+      const next = new Set(prev)
+      if (next.has(uid)) next.delete(uid)
+      else next.add(uid)
+      return next
+    })
+  }
+
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
     const files = Array.from(fileRef.current?.files ?? [])
     if (files.length === 0) return
 
-    setError('')
+    const assignTo = [...selectedExperts]
+    if (assignTo.length === 0) {
+      setUploadError('Select at least one expert to assign cases to.')
+      return
+    }
+
+    setUploadError('')
     setDone(false)
     setUploading(true)
 
     try {
-      const uid = await getCurrentUserId()
-      await uploadAndCreateCasesAndAssign(files, uid, setProgress)
+      await uploadAndCreateCasesAndAssign(files, assignTo, setProgress)
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
+      setUploadError(err instanceof Error ? err.message : String(err))
     } finally {
       setUploading(false)
       setDone(true)
@@ -76,29 +111,30 @@ export default function Admin({ navigate, reviewMode, onReviewModeChange }: Prop
     return <span className="status-error" title={p.error}>Error: {p.error}</span>
   }
 
-  const totalPending = counts ? counts.disputed + counts.escalated : null
+  const agreed    = resolutionStats.find(r => r.status === 'agreed')?.cnt    ?? 0
+  const disputed  = resolutionStats.find(r => r.status === 'disputed')?.cnt  ?? 0
+  const escalated = resolutionStats.find(r => r.status === 'escalated')?.cnt ?? 0
+  const resolved  = resolutionStats.find(r => r.status === 'resolved')?.cnt  ?? 0
 
   return (
     <div>
       <div className="nav">
-        <h1>Admin — Upload cases</h1>
+        <h1>Admin</h1>
         <button className="btn-secondary" onClick={() => navigate('queue')}>
           Back to queue
         </button>
       </div>
 
-      {error && <div className="error">{error}</div>}
-
-      {/* Review mode settings — admin only */}
+      {/* ── Review mode toggle (admin only) ──────────────────── */}
       {isAdmin && (
         <div className="card">
           <h2 style={{ marginBottom: '0.75rem' }}>Review mode</h2>
           <p style={{ fontSize: '0.875rem', color: '#6b7280', marginBottom: '0.75rem' }}>
             Controls how label disagreements are handled after 2 experts label the same case.
           </p>
-          <div style={{ display: 'flex', gap: '1.5rem', marginBottom: '0.5rem' }}>
+          <div style={{ display: 'flex', gap: '1.5rem', flexWrap: 'wrap' }}>
             {(['triage', 'dual'] as ReviewMode[]).map(mode => (
-              <label key={mode} style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', cursor: 'pointer' }}>
+              <label key={mode} style={{ display: 'flex', alignItems: 'flex-start', gap: '0.4rem', cursor: 'pointer' }}>
                 <input
                   type="radio"
                   name="review_mode"
@@ -106,13 +142,16 @@ export default function Admin({ navigate, reviewMode, onReviewModeChange }: Prop
                   checked={reviewMode === mode}
                   disabled={settingMode}
                   onChange={() => handleModeChange(mode)}
+                  style={{ marginTop: '0.2rem' }}
                 />
                 <span>
                   <strong>{mode === 'triage' ? 'Triage' : 'Dual'}</strong>
-                  {' — '}
-                  {mode === 'triage'
-                    ? 'auto-assign a 3rd expert on mismatch'
-                    : 'escalate for manual review, no 3rd assignment'}
+                  <span style={{ color: '#6b7280', fontSize: '0.875rem' }}>
+                    {' — '}
+                    {mode === 'triage'
+                      ? 'auto-assign a 3rd expert on mismatch'
+                      : 'escalate for manual review (no 3rd assignment)'}
+                  </span>
                 </span>
               </label>
             ))}
@@ -121,33 +160,91 @@ export default function Admin({ navigate, reviewMode, onReviewModeChange }: Prop
         </div>
       )}
 
-      {/* Escalated / disputed counts */}
+      {/* ── Resolution stats ─────────────────────────────────── */}
       <div className="card">
-        <h2 style={{ marginBottom: '0.75rem' }}>Resolution queue</h2>
-        {counts === null ? (
+        <h2 style={{ marginBottom: '0.75rem' }}>Resolution stats</h2>
+        {statsLoading ? (
           <div className="loading" style={{ fontSize: '0.875rem' }}>Loading…</div>
-        ) : totalPending === 0 ? (
-          <p style={{ fontSize: '0.875rem', color: '#6b7280' }}>No cases awaiting resolution.</p>
         ) : (
-          <div style={{ display: 'flex', gap: '2rem' }}>
-            {counts.disputed > 0 && (
-              <div>
-                <div className="queue-stat" style={{ fontSize: '1.75rem' }}>{counts.disputed}</div>
-                <p style={{ fontSize: '0.8rem', color: '#6b7280' }}>disputed (triage pending)</p>
+          <div style={{ display: 'flex', gap: '2rem', flexWrap: 'wrap' }}>
+            {[
+              { label: 'agreed',    count: agreed,    color: '#16a34a' },
+              { label: 'disputed',  count: disputed,  color: '#d97706' },
+              { label: 'escalated', count: escalated, color: '#dc2626' },
+              { label: 'resolved',  count: resolved,  color: '#6b7280' },
+            ].map(({ label, count, color }) => (
+              <div key={label}>
+                <div className="queue-stat" style={{ fontSize: '1.75rem', color }}>{count}</div>
+                <p style={{ fontSize: '0.8rem', color: '#6b7280' }}>{label}</p>
               </div>
-            )}
-            {counts.escalated > 0 && (
-              <div>
-                <div className="queue-stat" style={{ fontSize: '1.75rem' }}>{counts.escalated}</div>
-                <p style={{ fontSize: '0.8rem', color: '#6b7280' }}>escalated (dual mode)</p>
-              </div>
-            )}
+            ))}
           </div>
         )}
       </div>
 
-      {/* Upload form */}
+      {/* ── Per-expert progress ───────────────────────────────── */}
+      {expertStats.length > 0 && (
+        <div className="card">
+          <h2 style={{ marginBottom: '0.75rem' }}>Expert progress</h2>
+          <table style={{ width: '100%', fontSize: '0.875rem', borderCollapse: 'collapse' }}>
+            <thead>
+              <tr style={{ textAlign: 'left', borderBottom: '1px solid #e5e7eb' }}>
+                <th style={{ padding: '0.4rem 0.75rem 0.4rem 0', fontWeight: 600 }}>Expert</th>
+                <th style={{ padding: '0.4rem 0.75rem', fontWeight: 600, textAlign: 'right' }}>Assigned</th>
+                <th style={{ padding: '0.4rem 0.75rem', fontWeight: 600, textAlign: 'right' }}>Labeled</th>
+                <th style={{ padding: '0.4rem 0.75rem', fontWeight: 600, textAlign: 'right' }}>Remaining</th>
+              </tr>
+            </thead>
+            <tbody>
+              {expertStats.map(s => (
+                <tr key={s.expert_user_id} style={{ borderBottom: '1px solid #f3f4f6' }}>
+                  <td style={{ padding: '0.4rem 0.75rem 0.4rem 0', fontFamily: 'monospace', fontSize: '0.78rem', color: '#6b7280' }}>
+                    {s.expert_user_id.slice(0, 8)}…
+                  </td>
+                  <td style={{ padding: '0.4rem 0.75rem', textAlign: 'right' }}>{s.assigned_count}</td>
+                  <td style={{ padding: '0.4rem 0.75rem', textAlign: 'right' }}>{s.labeled_count}</td>
+                  <td style={{ padding: '0.4rem 0.75rem', textAlign: 'right', fontWeight: s.remaining_count > 0 ? 600 : undefined }}>
+                    {s.remaining_count}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {/* ── Upload form ───────────────────────────────────────── */}
       <div className="card">
+        <h2 style={{ marginBottom: '0.75rem' }}>Upload cases</h2>
+
+        {/* Expert assignment selection */}
+        {experts.length > 0 ? (
+          <div className="field">
+            <label>Assign to experts</label>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem', marginTop: '0.25rem' }}>
+              {experts.map(p => (
+                <label key={p.user_id} style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer', fontSize: '0.875rem' }}>
+                  <input
+                    type="checkbox"
+                    checked={selectedExperts.has(p.user_id)}
+                    onChange={() => toggleExpert(p.user_id)}
+                  />
+                  <span style={{ fontFamily: 'monospace', color: '#374151' }}>
+                    {p.user_id.slice(0, 8)}…
+                  </span>
+                </label>
+              ))}
+            </div>
+          </div>
+        ) : (
+          <p style={{ fontSize: '0.875rem', color: '#9ca3af', marginBottom: '0.75rem' }}>
+            No experts in profiles yet. Add expert rows to{' '}
+            <code>public.profiles</code> before uploading.
+          </p>
+        )}
+
+        {uploadError && <div className="error">{uploadError}</div>}
+
         <form onSubmit={handleSubmit}>
           <div className="field">
             <label htmlFor="files">Audiogram images (JPG / PNG)</label>
@@ -161,8 +258,12 @@ export default function Admin({ navigate, reviewMode, onReviewModeChange }: Prop
             />
           </div>
           <div className="btn-row">
-            <button type="submit" className="btn-primary" disabled={uploading}>
-              {uploading ? 'Uploading…' : 'Upload'}
+            <button
+              type="submit"
+              className="btn-primary"
+              disabled={uploading || selectedExperts.size === 0}
+            >
+              {uploading ? 'Uploading…' : `Upload & assign to ${selectedExperts.size} expert${selectedExperts.size !== 1 ? 's' : ''}`}
             </button>
           </div>
         </form>

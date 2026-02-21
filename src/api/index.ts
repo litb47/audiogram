@@ -7,6 +7,23 @@ export interface EscalatedCounts {
   escalated: number
 }
 
+export interface ExpertProfile {
+  user_id: string
+  role: string
+}
+
+export interface ExpertStat {
+  expert_user_id: string
+  assigned_count: number
+  labeled_count: number
+  remaining_count: number
+}
+
+export interface ResolutionStat {
+  status: string
+  cnt: number
+}
+
 export interface CaseRow {
   id: string
   image_path: string
@@ -70,6 +87,8 @@ export async function insertLabel(payload: LabelPayload): Promise<void> {
   if (error) throw error
 }
 
+// ── Review mode ──────────────────────────────────────────────
+
 export async function getReviewMode(): Promise<ReviewMode> {
   const { data, error } = await supabase
     .from('project_settings')
@@ -88,13 +107,7 @@ export async function setReviewMode(mode: ReviewMode): Promise<void> {
   if (error) throw error
 }
 
-export async function getEscalatedCounts(): Promise<EscalatedCounts> {
-  const [d, e] = await Promise.all([
-    supabase.from('case_resolution').select('*', { count: 'exact', head: true }).eq('status', 'disputed'),
-    supabase.from('case_resolution').select('*', { count: 'exact', head: true }).eq('status', 'escalated'),
-  ])
-  return { disputed: d.count ?? 0, escalated: e.count ?? 0 }
-}
+// ── User / role ──────────────────────────────────────────────
 
 export async function getUserRole(): Promise<string | null> {
   const { data: { user } } = await supabase.auth.getUser()
@@ -107,9 +120,42 @@ export async function getUserRole(): Promise<string | null> {
   return data?.role ?? null
 }
 
+export async function getExpertProfiles(): Promise<ExpertProfile[]> {
+  const { data, error } = await supabase
+    .from('profiles')
+    .select('user_id, role')
+    .eq('role', 'expert')
+  if (error) throw error
+  return (data ?? []) as ExpertProfile[]
+}
+
+// ── Dashboard stats ──────────────────────────────────────────
+
+export async function getEscalatedCounts(): Promise<EscalatedCounts> {
+  const [d, e] = await Promise.all([
+    supabase.from('case_resolution').select('*', { count: 'exact', head: true }).eq('status', 'disputed'),
+    supabase.from('case_resolution').select('*', { count: 'exact', head: true }).eq('status', 'escalated'),
+  ])
+  return { disputed: d.count ?? 0, escalated: e.count ?? 0 }
+}
+
+export async function getExpertStats(): Promise<ExpertStat[]> {
+  const { data, error } = await supabase.rpc('get_expert_stats')
+  if (error) throw error
+  return (data ?? []) as ExpertStat[]
+}
+
+export async function getResolutionStats(): Promise<ResolutionStat[]> {
+  const { data, error } = await supabase.rpc('get_resolution_stats')
+  if (error) throw error
+  return (data ?? []) as ResolutionStat[]
+}
+
+// ── Upload + assignment (uses server-side RPC) ───────────────
+
 export async function uploadAndCreateCasesAndAssign(
   files: File[],
-  uid: string,
+  expertIds: string[],           // replaces single uid — pass array of expert user_ids
   onProgress: (updates: UploadProgress[]) => void
 ): Promise<void> {
   const statuses: UploadProgress[] = files.map(f => ({
@@ -123,25 +169,19 @@ export async function uploadAndCreateCasesAndAssign(
     const path = `cases/${Date.now()}_${file.name}`
 
     try {
-      // 1. Upload file to storage
+      // 1. Upload file to storage (client-side, signed by anon key)
       const { error: uploadError } = await supabase.storage
         .from('audiograms')
         .upload(path, file)
       if (uploadError) throw uploadError
 
-      // 2. Insert case row
-      const { data: caseData, error: caseError } = await supabase
-        .from('cases')
-        .insert({ image_path: path })
-        .select('id')
-        .single()
-      if (caseError || !caseData) throw caseError ?? new Error('No case returned')
-
-      // 3. Insert assignment row
-      const { error: assignError } = await supabase
-        .from('assignments')
-        .insert({ case_id: caseData.id, expert_user_id: uid })
-      if (assignError) throw assignError
+      // 2. Create case row + assignments via SECURITY DEFINER RPC
+      //    (bypasses RLS — admin check is enforced inside the function)
+      const { error: rpcError } = await supabase.rpc(
+        'admin_create_case_with_assignments',
+        { p_image_path: path, p_expert_ids: expertIds }
+      )
+      if (rpcError) throw rpcError
 
       statuses[i] = { filename: file.name, status: 'inserted' }
     } catch (err) {
