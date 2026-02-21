@@ -1,5 +1,12 @@
 import { supabase } from '../lib/supabase'
 
+export type ReviewMode = 'dual' | 'triage'
+
+export interface EscalatedCounts {
+  disputed: number
+  escalated: number
+}
+
 export interface CaseRow {
   id: string
   image_path: string
@@ -61,6 +68,43 @@ export async function createSignedImageUrl(path: string): Promise<string> {
 export async function insertLabel(payload: LabelPayload): Promise<void> {
   const { error } = await supabase.from('labels').insert(payload)
   if (error) throw error
+}
+
+export async function getReviewMode(): Promise<ReviewMode> {
+  const { data, error } = await supabase
+    .from('project_settings')
+    .select('review_mode')
+    .eq('id', 1)
+    .single()
+  if (error) throw error
+  return (data?.review_mode ?? 'triage') as ReviewMode
+}
+
+export async function setReviewMode(mode: ReviewMode): Promise<void> {
+  const { error } = await supabase
+    .from('project_settings')
+    .update({ review_mode: mode })
+    .eq('id', 1)
+  if (error) throw error
+}
+
+export async function getEscalatedCounts(): Promise<EscalatedCounts> {
+  const [d, e] = await Promise.all([
+    supabase.from('case_resolution').select('*', { count: 'exact', head: true }).eq('status', 'disputed'),
+    supabase.from('case_resolution').select('*', { count: 'exact', head: true }).eq('status', 'escalated'),
+  ])
+  return { disputed: d.count ?? 0, escalated: e.count ?? 0 }
+}
+
+export async function getUserRole(): Promise<string | null> {
+  const { data: { user } } = await supabase.auth.getUser()
+  if (!user) return null
+  const { data } = await supabase
+    .from('profiles')
+    .select('role')
+    .eq('user_id', user.id)
+    .single()
+  return data?.role ?? null
 }
 
 export async function uploadAndCreateCasesAndAssign(
